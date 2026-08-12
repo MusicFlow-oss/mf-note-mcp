@@ -1,0 +1,16 @@
+node_modules/
+build/
+dist/
+*.log
+.env
+.DS_Store
+*.tsbuildinfo
+screenshots/
+data/
+note-state.json
+.x-state.json
+x-state.json
+.facebook-state.json
+facebook-state.json
+
+src/version.ts
