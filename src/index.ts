@@ -211,23 +211,44 @@ async function postToNote(params: {
     // サムネイル画像の設定
     if (thumbnailPath && fs.existsSync(thumbnailPath)) {
       log('Uploading thumbnail image');
-      const candidates = page.locator('button[aria-label="画像を追加"]');
 
-      // 既にアイキャッチが設定されている記事（update 時）には「画像を追加」が無い。
+      // アイキャッチ追加ボタンのセレクタ。
+      // ⚠️ 2026-08-13: note のエディタ刷新で aria-label="画像を追加" が消えた。
+      // 実体は「タイトル欄の上にある 40x40 の円形ボタン」で、aria-label もテキストも
+      // 持たず `data-id="ButtonIcon"` だけが手掛かり。
+      // ⚠️ ただし `data-id="ButtonIcon"` は**「閉じる」ボタン（aria-label 付き・y=17）にも付く**。
+      // 実測でそれを掴んでしまい、バナーを閉じただけでダイアログが開かず
+      // 「画像をアップロード」の待機でハングした。**aria-label を持つものは除外する**。
+      // 旧セレクタは後方互換のため残す（どちらか当たった方を使う）。
+      const ADD_BTN =
+        'button[aria-label="画像を追加"], button[data-id="ButtonIcon"]:not([aria-label])';
+      const candidates = page.locator(ADD_BTN);
+
+      // 既にアイキャッチが設定されている記事（update 時）には追加ボタンが無い。
       // note のエディタには「変更」ボタンが存在せず、画像に重なった × で一度消すと
-      // 「画像を追加」が現れる、という UI なので、先に削除する。
-      // 「画像を追加」ボタン or 既存アイキャッチ画像のどちらかが現れるまで待つ
+      // 追加ボタンが現れる、という UI なので、先に削除する。
+      // 追加ボタン or 既存アイキャッチ画像のどちらかが現れるまで待つ
       // （isVisible() は即時判定なので、描画前に呼ぶと必ず false になる）
-      await page.waitForFunction(
-        () => {
-          if (document.querySelector('button[aria-label="画像を追加"]')) return true;
-          return Array.from(document.querySelectorAll('img')).some((i) => {
-            const r = i.getBoundingClientRect();
-            return /assets\.st-note\.com/.test(i.src) && r.top < 600 && r.width > 300;
-          });
-        },
-        { timeout }
-      );
+      // ⚠️ ここで両方の条件が永久に成立しないと無言でハングする（2026-08-13 実際に踏んだ）。
+      // timeout したら「何が見つからなかったか」を必ず言う。
+      await page
+        .waitForFunction(
+          (sel) => {
+            if (document.querySelector(sel)) return true;
+            return Array.from(document.querySelectorAll('img')).some((i) => {
+              const r = i.getBoundingClientRect();
+              return /assets\.st-note\.com/.test(i.src) && r.top < 600 && r.width > 300;
+            });
+          },
+          ADD_BTN,
+          { timeout }
+        )
+        .catch(() => {
+          throw new Error(
+            'アイキャッチの設定を開始できませんでした（追加ボタンも既存画像も見つからない）。' +
+              `note のエディタ構造が変わった可能性があります。探したセレクタ: ${ADD_BTN}`
+          );
+        });
 
       const hasAddBtn = await candidates.first().isVisible().catch(() => false);
       if (!hasAddBtn) {
@@ -259,17 +280,37 @@ async function postToNote(params: {
 
       await candidates.first().waitFor({ state: 'visible', timeout });
 
+      // どれがアイキャッチのボタンかを位置で決める。
+      // アイキャッチは必ず**タイトル欄のすぐ上**にあるので、
+      // 「タイトルより上」かつ「タイトルに最も近い（＝y が最大）」を選ぶ。
+      // ⚠️ 「最も上」で選ぶと、ページ最上部のバナー等を掴む（実測で踏んだ）。
+      const titleTop = await page
+        .locator('textarea[placeholder*="タイトル"]')
+        .first()
+        .boundingBox()
+        .then((b) => (b ? b.y : Infinity))
+        .catch(() => Infinity);
+
       let target = candidates.first();
       const cnt = await candidates.count();
       if (cnt > 1) {
-        let minY = Infinity;
-        let idx = 0;
+        let maxY = -Infinity;
+        let idx = -1;
         for (let i = 0; i < cnt; i++) {
           const box = await candidates.nth(i).boundingBox();
-          if (box && box.y < minY) {
-            minY = box.y;
+          if (!box) continue;
+          // タイトル欄より下のボタン（本文側のアイコン）は候補から外す
+          if (box.y >= titleTop) continue;
+          if (box.y > maxY) {
+            maxY = box.y;
             idx = i;
           }
+        }
+        if (idx < 0) {
+          throw new Error(
+            'アイキャッチの追加ボタンを特定できませんでした（タイトル欄より上に候補が無い）。' +
+              'note のエディタ構造が変わった可能性があります。'
+          );
         }
         target = candidates.nth(idx);
       }
@@ -328,18 +369,24 @@ async function postToNote(params: {
       await dialog.waitFor({ state: 'hidden', timeout }).catch(() => {});
       await page.waitForLoadState('networkidle', { timeout }).catch(() => {});
 
-      // 反映確認
-      const changedBtn = page.locator('button[aria-label="画像を変更"]');
-      const addBtn = page.locator('button[aria-label="画像を追加"]');
-
+      // 反映確認。
+      // ⚠️ aria-label 版（画像を変更／画像を追加）はエディタ刷新で消えているので、
+      // それだけに頼らず「アイキャッチ画像が実際に出たか」を直接見る。
       let applied = false;
       try {
-        await changedBtn.waitFor({ state: 'visible', timeout: 5000 });
+        await page.waitForFunction(
+          () =>
+            Array.from(document.querySelectorAll('img')).some((i) => {
+              const r = i.getBoundingClientRect();
+              return /assets\.st-note\.com/.test(i.src) && r.top < 600 && r.width > 300;
+            }),
+          { timeout: 8000 }
+        );
         applied = true;
       } catch {}
       if (!applied) {
         try {
-          await addBtn.waitFor({ state: 'hidden', timeout: 5000 });
+          await page.locator('button[aria-label="画像を変更"]').waitFor({ state: 'visible', timeout: 3000 });
           applied = true;
         } catch {}
       }
