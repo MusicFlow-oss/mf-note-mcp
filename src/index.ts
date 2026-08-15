@@ -30,6 +30,10 @@ const SERVER_VERSION = VERSION;
 const DEFAULT_STATE_PATH = process.env.NOTE_POST_MCP_STATE_PATH ?? 
   path.join(os.homedir(), '.note-state.json');
 const DEFAULT_TIMEOUT = parseInt(process.env.NOTE_POST_MCP_TIMEOUT ?? '180000', 10);
+// エディタ UI の「一手」（ボタンを押したらダイアログが開く、等）に許す上限。
+// ツール全体の timeout（呼び出し側が数分〜10 分を渡す）で待つと、ボタンを取り違えた
+// ときにその全部を無言で使い切る。UI の一手はこの上限で見切って原因を言う。
+const UI_STEP_TIMEOUT = 15000;
 // X（旧 Twitter）の認証情報。ツール定義でも参照するのでここで宣言する
 const DEFAULT_X_STATE_PATH = process.env.X_STATE_PATH ?? path.join(os.homedir(), '.x-state.json');
 // Facebook Page の認証情報。同上
@@ -37,10 +41,27 @@ const DEFAULT_FACEBOOK_STATE_PATH =
   process.env.FACEBOOK_STATE_PATH ?? path.join(os.homedir(), '.facebook-state.json');
 const FACEBOOK_GRAPH_VERSION = 'v26.0';
 
+// ログの出力先。stderr に加えてファイルにも追記する。
+// ⚠️ MCP クライアントはサーバーの stderr を起動時以外ほとんど残さないので、
+// 「本当に時間がかかっているのか／応答経路で詰まっているのか」を後から
+// 切り分けるにはファイルが必要（2026-08-15 の update_draft ハング調査で実感）。
+const DEFAULT_LOG_PATH = process.env.NOTE_POST_MCP_LOG_PATH ?? path.join(os.tmpdir(), 'note-post-mcp.log');
+
 // ログ用ユーティリティ
 function log(message: string, data?: any) {
   const timestamp = new Date().toISOString();
   console.error(`[${timestamp}] [${SERVER_NAME}] ${message}`, data ?? '');
+  try {
+    const extra = data === undefined ? '' : ` ${typeof data === 'string' ? data : JSON.stringify(data)}`;
+    fs.appendFileSync(DEFAULT_LOG_PATH, `[${timestamp}] [${SERVER_NAME}] [pid ${process.pid}] ${message}${extra}\n`);
+  } catch {
+    // ログファイルに書けなくても本処理は止めない
+  }
+}
+
+// 経過秒（ログ用）
+function elapsedSec(startMs: number): string {
+  return `${((Date.now() - startMs) / 1000).toFixed(1)}s`;
 }
 
 // 現在時刻のフォーマット
@@ -153,6 +174,11 @@ async function postToNote(params: {
     paidLineAfter: paidLineAfterParam,
   } = params;
 
+  // 処理時間の記録（開始からの経過を各フェーズのログに付ける）。
+  // 「本当に時間がかかっているのか／どこで止まったのか」を後から追えるようにする。
+  const startedAt = Date.now();
+  const phase = (message: string, data?: any) => log(`${message} (+${elapsedSec(startedAt)})`, data);
+
   // Markdownファイルを読み込み
   if (!fs.existsSync(markdownPath)) {
     throw new Error(`Markdown file not found: ${markdownPath}`);
@@ -166,7 +192,7 @@ async function postToNote(params: {
   const baseDir = path.dirname(markdownPath);
   const images = extractImages(body, baseDir, (m) => log(m));
 
-  log('Parsed markdown', { title, bodyLength: body.length, tags, imageCount: images.length });
+  phase('Parsed markdown', { title, bodyLength: body.length, tags, imageCount: images.length });
 
   // 認証状態ファイルを確認
   if (!fs.existsSync(statePath)) {
@@ -210,7 +236,7 @@ async function postToNote(params: {
 
     // サムネイル画像の設定
     if (thumbnailPath && fs.existsSync(thumbnailPath)) {
-      log('Uploading thumbnail image');
+      phase('Uploading thumbnail image');
 
       // アイキャッチ追加ボタンのセレクタ。
       // ⚠️ 2026-08-13: note のエディタ刷新で aria-label="画像を追加" が消えた。
@@ -219,10 +245,31 @@ async function postToNote(params: {
       // ⚠️ ただし `data-id="ButtonIcon"` は**「閉じる」ボタン（aria-label 付き・y=17）にも付く**。
       // 実測でそれを掴んでしまい、バナーを閉じただけでダイアログが開かず
       // 「画像をアップロード」の待機でハングした。**aria-label を持つものは除外する**。
+      // ⚠️ 2026-08-15: さらに、**既存アイキャッチの右上に重なる「×（削除）」ボタンも
+      // 同じ `data-id="ButtonIcon"`（aria-label 無し）**だと判明した。既にアイキャッチが
+      // ある記事では候補がその × ただ1つになり、「追加ボタンが見えている」と誤判定して
+      // 削除ステップを飛ばし、× を追加ボタンのつもりで押してしまう。× なので
+      // ダイアログは開かず、「画像をアップロード」の待機で timeout いっぱい（呼び出し側が
+      // 10 分を渡すと 10 分）無言でハングした（update_draft の初回が必ず止まり、
+      // × で旧画像が消えた後の再送だけ通る、という形で 27 記事中ほぼ全件で再現）。
+      // したがって**追加ボタンかどうかはセレクタでは決められない**。
+      // 「既存画像があるか」は画像で判定し、候補ボタンは**画像の矩形に重なるものを × とみなして除外**する。
       // 旧セレクタは後方互換のため残す（どちらか当たった方を使う）。
       const ADD_BTN =
         'button[aria-label="画像を追加"], button[data-id="ButtonIcon"]:not([aria-label])';
       const candidates = page.locator(ADD_BTN);
+
+      // アイキャッチ画像の実体（タイトルの上に出る大きい st-note 画像）の矩形を返す。無ければ null。
+      const findEyecatchRect = () =>
+        page.evaluate(() => {
+          const img = Array.from(document.querySelectorAll('img')).find((i) => {
+            const r = i.getBoundingClientRect();
+            return /assets\.st-note\.com/.test(i.src) && r.top < 600 && r.width > 300;
+          });
+          if (!img) return null;
+          const r = img.getBoundingClientRect();
+          return { x: r.x, y: r.y, width: r.width, height: r.height };
+        });
 
       // 既にアイキャッチが設定されている記事（update 時）には追加ボタンが無い。
       // note のエディタには「変更」ボタンが存在せず、画像に重なった × で一度消すと
@@ -250,9 +297,10 @@ async function postToNote(params: {
           );
         });
 
-      const hasAddBtn = await candidates.first().isVisible().catch(() => false);
-      if (!hasAddBtn) {
-        log('Existing eyecatch found, removing it first');
+      // 「既存アイキャッチがあるか」は候補ボタンの有無ではなく**画像の有無**で決める（上記 × の件）。
+      const existingRect = await findEyecatchRect();
+      if (existingRect) {
+        phase('Existing eyecatch found, removing it first');
         const removed = await page.evaluate(() => {
           const img = Array.from(document.querySelectorAll('img')).find((i) => {
             const r = i.getBoundingClientRect();
@@ -275,51 +323,93 @@ async function postToNote(params: {
             'アイキャッチの差し替えに失敗しました（既存画像の削除ボタンが見つからない）。note のエディタ構造が変わった可能性があります。'
           );
         }
+        // 画像が実際に消えるまで待つ（消えないまま進むと、また × を掴む）。
+        // ここは UI の一手なので、ツール全体の timeout ではなく短い上限で見切る。
+        await page
+          .waitForFunction(
+            () =>
+              !Array.from(document.querySelectorAll('img')).some((i) => {
+                const r = i.getBoundingClientRect();
+                return /assets\.st-note\.com/.test(i.src) && r.top < 600 && r.width > 300;
+              }),
+            { timeout: Math.min(timeout, UI_STEP_TIMEOUT) }
+          )
+          .catch(() => {
+            throw new Error(
+              '既存アイキャッチの削除が反映されませんでした（× を押しても画像が残っている）。note のエディタ構造が変わった可能性があります。'
+            );
+          });
         await page.waitForTimeout(800);
+        phase('Existing eyecatch removed');
       }
 
-      await candidates.first().waitFor({ state: 'visible', timeout });
+      await candidates
+        .first()
+        .waitFor({ state: 'visible', timeout: Math.min(timeout, UI_STEP_TIMEOUT) })
+        .catch(() => {
+          throw new Error(
+            'アイキャッチの追加ボタンが現れませんでした。note のエディタ構造が変わった可能性があります。' +
+              `探したセレクタ: ${ADD_BTN}`
+          );
+        });
 
       // どれがアイキャッチのボタンかを位置で決める。
       // アイキャッチは必ず**タイトル欄のすぐ上**にあるので、
       // 「タイトルより上」かつ「タイトルに最も近い（＝y が最大）」を選ぶ。
       // ⚠️ 「最も上」で選ぶと、ページ最上部のバナー等を掴む（実測で踏んだ）。
+      // ⚠️ 候補が1つでも無条件に採用しない（それが × のことがある。上記 2026-08-15 の件）。
+      //    まだ画像が残っていればその矩形に重なる候補は除外する。
       const titleTop = await page
         .locator('textarea[placeholder*="タイトル"]')
         .first()
         .boundingBox()
         .then((b) => (b ? b.y : Infinity))
         .catch(() => Infinity);
+      const leftoverRect = await findEyecatchRect();
+      const overlaps = (box: { x: number; y: number; width: number; height: number }) =>
+        !!leftoverRect &&
+        box.x < leftoverRect.x + leftoverRect.width &&
+        box.x + box.width > leftoverRect.x &&
+        box.y < leftoverRect.y + leftoverRect.height &&
+        box.y + box.height > leftoverRect.y;
 
-      let target = candidates.first();
       const cnt = await candidates.count();
-      if (cnt > 1) {
-        let maxY = -Infinity;
-        let idx = -1;
-        for (let i = 0; i < cnt; i++) {
-          const box = await candidates.nth(i).boundingBox();
-          if (!box) continue;
-          // タイトル欄より下のボタン（本文側のアイコン）は候補から外す
-          if (box.y >= titleTop) continue;
-          if (box.y > maxY) {
-            maxY = box.y;
-            idx = i;
-          }
+      let maxY = -Infinity;
+      let idx = -1;
+      for (let i = 0; i < cnt; i++) {
+        const box = await candidates.nth(i).boundingBox();
+        if (!box) continue;
+        // タイトル欄より下のボタン（本文側のアイコン）は候補から外す
+        if (box.y >= titleTop) continue;
+        // 既存画像に重なるボタンは × なので外す
+        if (overlaps(box)) continue;
+        if (box.y > maxY) {
+          maxY = box.y;
+          idx = i;
         }
-        if (idx < 0) {
-          throw new Error(
-            'アイキャッチの追加ボタンを特定できませんでした（タイトル欄より上に候補が無い）。' +
-              'note のエディタ構造が変わった可能性があります。'
-          );
-        }
-        target = candidates.nth(idx);
       }
+      if (idx < 0) {
+        throw new Error(
+          'アイキャッチの追加ボタンを特定できませんでした（タイトル欄より上に、既存画像と重ならない候補が無い）。' +
+            'note のエディタ構造が変わった可能性があります。'
+        );
+      }
+      const target = candidates.nth(idx);
 
       await target.scrollIntoViewIfNeeded();
       await target.click({ force: true });
 
+      // ⚠️ ここは追加ボタンを取り違えたときにハングしていた箇所。ツール全体の timeout
+      // （呼び出し側が 10 分を渡すことがある）で待たず、短い上限で見切って原因を言う。
       const uploadBtn = page.locator('button:has-text("画像をアップロード")').first();
-      await uploadBtn.waitFor({ state: 'visible', timeout });
+      await uploadBtn
+        .waitFor({ state: 'visible', timeout: Math.min(timeout, UI_STEP_TIMEOUT) })
+        .catch(() => {
+          throw new Error(
+            'アイキャッチの追加ボタンを押しても画像ダイアログ（「画像をアップロード」）が開きませんでした。' +
+              '別のボタンを掴んだ可能性があります（note のエディタ構造が変わったか、既存アイキャッチの × を追加ボタンと取り違えた）。'
+          );
+        });
 
       let chooser = null;
       try {
@@ -391,13 +481,15 @@ async function postToNote(params: {
         } catch {}
       }
       if (!applied) {
-        log('Thumbnail reflection uncertain, continuing');
+        phase('Thumbnail reflection uncertain, continuing');
+      } else {
+        phase('Thumbnail applied');
       }
     }
 
     // タイトル設定
     await page.fill('textarea[placeholder*="タイトル"]', title);
-    log('Title set');
+    phase('Title set');
 
     // 本文設定（行ごとに処理してURLをリンクカードに変換、画像を埋め込む）
     const bodyBox = page.locator('div[contenteditable="true"][role="textbox"]').first();
@@ -409,7 +501,7 @@ async function postToNote(params: {
       await page.keyboard.press(process.platform === 'darwin' ? 'Meta+a' : 'Control+a');
       await page.keyboard.press('Backspace');
       await page.waitForTimeout(400);
-      log('Cleared existing body for update');
+      phase('Cleared existing body for update');
     }
 
     const lines = body.split('\n');
@@ -611,14 +703,14 @@ async function postToNote(params: {
       }
     }
     
-    log('Body set');
+    phase('Body set');
 
     // リンクカード化の取りこぼしを掃除する（カード＋素のURL段落が二重に残る事故への対処）。
     // ⚠️ 掃除しきれなかったら**保存せずに中断する**。二重リンクのまま公開すると
     // 読者に見える壊れ方をするので、黙って成功を返すより止めるほうがよい。
     const orphanCleanup = await cleanupOrphanLinkCardUrls(page, timeout);
     if (orphanCleanup.removed.length) {
-      log('Removed orphan raw URLs', { urls: orphanCleanup.removed });
+      phase('Removed orphan raw URLs', { urls: orphanCleanup.removed });
     }
     if (orphanCleanup.remaining.length) {
       throw new Error(
@@ -655,7 +747,7 @@ async function postToNote(params: {
 
       await page.screenshot({ path: screenshotPath, fullPage: true });
       const finalUrl = page.url();
-      log('Draft saved', { url: finalUrl });
+      phase('Draft saved', { url: finalUrl });
 
       await context.close();
       await browser.close();
@@ -689,7 +781,7 @@ async function postToNote(params: {
 
     // タグ入力
     if (setTags && tags.length > 0) {
-      log('Adding tags', { tags });
+      phase('Adding tags', { tags });
       let tagInput = page.locator('input[placeholder*="ハッシュタグ"]');
       if (!(await tagInput.count())) {
         tagInput = page.locator('input[role="combobox"]').first();
@@ -730,7 +822,7 @@ async function postToNote(params: {
             'paid_line_after 引数か md の front matter `paid_line_after` で指定してください。'
         );
       }
-      log('Paid article detected, opening 有料エリア設定', { paidLineAfter });
+      phase('Paid article detected, opening 有料エリア設定', { paidLineAfter });
       await areaBtn.click({ force: true });
       await page.waitForTimeout(1500);
 
@@ -749,7 +841,7 @@ async function postToNote(params: {
         );
       }
       paidLine = lineResult;
-      log('Paid line set', paidLine);
+      phase('Paid line set', paidLine);
     }
 
     // 投稿する（公開済み記事の再公開では「更新する」になる）
@@ -776,7 +868,7 @@ async function postToNote(params: {
 
     await page.screenshot({ path: screenshotPath, fullPage: true });
     const finalUrl = page.url();
-    log('Published', { url: finalUrl });
+    phase('Published', { url: finalUrl });
 
     await context.close();
     await browser.close();
@@ -3480,10 +3572,69 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
 }));
 
 // ツール呼び出しハンドラ
-server.setRequestHandler(CallToolRequestSchema, async (request) => {
+server.setRequestHandler(CallToolRequestSchema, async (request, extra) => {
   const { name, arguments: args } = request.params;
 
+  // 処理時間の記録。開始・終了（成功/失敗）・クライアントからの中断を、経過秒つきで残す。
+  //
+  // ⚠️ クライアント側の中断について（2026-08-15 実測）:
+  // 一部の MCP クライアントは、ツール実行中にユーザーが次のメッセージを送ると
+  // その場でリクエストを cancel し、呼び出し側には `MCP error -32001: AbortError: interrupt`
+  // のような **タイムアウトではない**エラーが返る。cancel 通知はここ（extra.signal）に届くが、
+  // このサーバーは途中で止めずに最後まで走らせる（本文を消した直後に止めると記事が
+  // 半端な状態で残るため）。そのため「クライアントには失敗と見えたが note には反映されている」
+  // ことがあり、後から真相を追えるように cancel 時刻と最終結果を両方ログに残す。
+  const startedAt = Date.now();
+  const requestId = extra?.requestId;
+  let cancelledAfter: string | undefined;
+  const onAbort = () => {
+    cancelledAfter = elapsedSec(startedAt);
+    log(`Tool cancelled by client after ${cancelledAfter}; continuing to completion`, {
+      name,
+      requestId,
+      reason: String(extra?.signal?.reason ?? ''),
+    });
+  };
+  extra?.signal?.addEventListener('abort', onAbort, { once: true });
+  const finish = (ok: boolean, detail?: any) => {
+    extra?.signal?.removeEventListener('abort', onAbort);
+    log(`Tool ${ok ? 'finished' : 'failed'} after ${elapsedSec(startedAt)}`, {
+      name,
+      requestId,
+      ...(cancelledAfter ? { cancelledByClientAfter: cancelledAfter } : {}),
+      ...(detail !== undefined ? { detail } : {}),
+    });
+  };
+  log('Tool started', { name, requestId });
+
   try {
+    const result = await handleToolCall(name, args);
+    finish(true);
+    return result;
+  } catch (error) {
+    const errorMessage = error instanceof Error ? error.message : String(error);
+    finish(false, errorMessage);
+    return {
+      content: [
+        {
+          type: 'text',
+          text: JSON.stringify(
+            {
+              success: false,
+              error: errorMessage,
+            },
+            null,
+            2
+          ),
+        },
+      ],
+      isError: true,
+    };
+  }
+});
+
+async function handleToolCall(name: string, args: unknown): Promise<any> {
+  {
     if (name === 'publish_note') {
       const params = PublishNoteSchema.parse(args);
       const result = await postToNote({
@@ -3604,6 +3755,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
                 build_time: BUILD_TIME,
                 git_commit: GIT_COMMIT,
                 pid: process.pid,
+                log_path: DEFAULT_LOG_PATH,
                 note: 'build/version.json と一致しなければ、MCP クライアントが古いプロセスを掴んでいます（再接続が必要）',
               },
               null,
@@ -3748,27 +3900,8 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
     }
 
     throw new Error(`Unknown tool: ${name}`);
-  } catch (error) {
-    const errorMessage = error instanceof Error ? error.message : String(error);
-    log('Tool execution error', { name, error: errorMessage });
-    return {
-      content: [
-        {
-          type: 'text',
-          text: JSON.stringify(
-            {
-              success: false,
-              error: errorMessage,
-            },
-            null,
-            2
-          ),
-        },
-      ],
-      isError: true,
-    };
   }
-});
+}
 
 // サーバー起動
 async function main() {

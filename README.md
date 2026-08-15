@@ -61,6 +61,7 @@ After editing `src/index.ts`, run `npm run build`, then **reconnect the client**
 |---|---|---|
 | `NOTE_POST_MCP_STATE_PATH` | `~/.note-state.json` | note.com auth state file |
 | `NOTE_POST_MCP_TIMEOUT` | `180000` | Browser operation timeout (ms) |
+| `NOTE_POST_MCP_LOG_PATH` | `<os tmpdir>/note-post-mcp.log` | Append-only log with per-tool start/finish times, phase timings and client cancellations (also on stderr). `server_info` reports the path |
 | `MCP_NAME` | `note-post-mcp` | Server name override |
 | `X_STATE_PATH` | `~/.x-state.json` | X credentials; read only when `post_to_x` is called |
 | `FACEBOOK_STATE_PATH` | `~/.facebook-state.json` | Facebook credentials; read only when `post_to_facebook` is called |
@@ -169,7 +170,8 @@ Body handling:
 - **Authentication errors** — the session expired; rerun `npm run login`.
 - **Editor fails to launch, missing `Chromium Framework`** — Playwright's extraction hung at 100%. Extract the downloaded zip manually.
 - **A change to the code has no effect** — the client is holding the process it spawned. Compare `server_info` against `build/version.json` and reconnect.
-- **Timeouts** — raise `NOTE_POST_MCP_TIMEOUT` or pass a larger `timeout`.
+- **Timeouts** — raise `NOTE_POST_MCP_TIMEOUT` or pass a larger `timeout`. Single editor steps (opening the image dialog, removing an eyecatch) are capped at 15 s regardless and fail with a message saying what did not appear, so a mis-targeted button no longer consumes the whole timeout.
+- **`MCP error -32001: AbortError: interrupt`** — this is not a timeout and not raised by this server. Some clients cancel the in-flight tool call when the user sends another message while a tool is running; the SDK surfaces that cancellation as `-32001`. This server keeps running the browser flow to completion (stopping halfway could leave an article half-edited), so the change usually *has* been applied on note even though the client reported an error. Check the log file (`NOTE_POST_MCP_LOG_PATH`) for `Tool cancelled by client after …` followed by `Tool finished` before retrying — a retry re-runs the whole flow.
 
 ## References
 
