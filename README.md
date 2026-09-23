@@ -14,7 +14,17 @@ Not published to npm: clone, build, and register `build/index.js` directly.
 - A desktop OS with a GUI session
 - A note.com account
 
-## Install
+## Install for Claude Desktop (no terminal)
+
+Download the `.mcpb` from [Releases](https://github.com/MusicFlow-oss/mf-note-mcp/releases) and double-click it, or drag it onto the Claude Desktop window. Claude Desktop ships its own Node.js, so nothing else has to be installed.
+
+Then tell Claude: **"log in to note"**. A browser window opens; log in the way you normally do, and say **"I'm logged in"** when you're done. The session is saved to `~/.note-state.json` (mode `600`) on your machine. Your password is never stored or seen by this tool.
+
+The first login also downloads the browser this tool drives (~300MB), which takes a few minutes. It is not bundled in the `.mcpb`.
+
+While this tool works on an article, a visible browser window moves on its own. Leave it alone until it finishes — see the note about headed mode above.
+
+## Install from source (terminal)
 
 ```bash
 git clone <this-repo> mf-note-mcp
@@ -30,7 +40,15 @@ Then create the auth state file:
 npm run login
 ```
 
-A visible browser window opens. Log in to note.com, then press Enter in the terminal. This writes `~/.note-state.json` (mode `600`) with your session cookies. It expires after a few weeks — rerun to refresh. Keep the file private.
+A visible browser window opens. Log in to note.com — the script notices on its own and saves the session, no keypress needed. This writes `~/.note-state.json` (mode `600`) with your session cookies. Rerun it whenever the session stops working. Keep the file private.
+
+## Build the .mcpb
+
+```bash
+npm run pack
+```
+
+Writes `dist/mf-note-mcp-<version>.mcpb` (about 6MB). It stages the build plus production dependencies only — no `node_modules` from devDependencies, no `.git`, and no browser binary. Keep `manifest.json`'s `version` in step with `package.json`; the script refuses to pack when they disagree.
 
 ## Register with a client
 
@@ -40,7 +58,7 @@ Any MCP client works; point it at the built entry with an absolute path. For Cla
 claude mcp add note-post -s user -- node /absolute/path/to/mf-note-mcp/build/index.js
 ```
 
-For a JSON-configured client (Cursor, VS Code, Claude Desktop):
+For a JSON-configured client (Cursor, VS Code, or Claude Desktop without the `.mcpb`):
 
 ```json
 {
@@ -69,6 +87,15 @@ After editing `src/index.ts`, run `npm run build`, then **reconnect the client**
 ## Tools
 
 Every tool also accepts `state_path` and `timeout`. Tools that drive the browser additionally accept `screenshot_dir`.
+
+### Login
+
+| Tool | What it does |
+| --- | --- |
+| `note_login_start` | Opens a browser window at note.com's login page and returns immediately. Downloads the browser first if it is missing. |
+| `note_login_finish` | Checks whether the login went through, saves the session, and closes the window. Returns "not yet" if the user is still working, and reports download progress while the browser is being fetched. |
+
+Login is deliberately split in two: a single call cannot wait for a human to finish typing without hitting the client's tool timeout.
 
 ### Server
 

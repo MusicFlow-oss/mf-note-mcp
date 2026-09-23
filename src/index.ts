@@ -7,7 +7,9 @@ import {
   ListToolsRequestSchema,
   Tool,
 } from '@modelcontextprotocol/sdk/types.js';
-import { chromium } from 'playwright';
+import { chromium, type Browser, type BrowserContext, type Page } from 'playwright';
+import { spawn, execFileSync, type ChildProcess } from 'child_process';
+import { createRequire } from 'module';
 import { z } from 'zod';
 import * as fs from 'fs';
 import * as path from 'path';
@@ -17,6 +19,7 @@ import 'dotenv/config';
 import { VERSION, BUILD_TIME, GIT_COMMIT } from './version.js';
 import { extractImages, parseMarkdown } from './markdown.js';
 import { countXWeightedLength } from './xtext.js';
+import { checkNoteLogin, checkNoteLoginFile } from './login.js';
 
 // 名称一貫性
 const SERVER_NAME = process.env.MCP_NAME ?? 'note-post-mcp';
@@ -2847,6 +2850,16 @@ const DeleteMagazineSchema = z.object({
   timeout: z.number().optional().describe(`タイムアウト（ミリ秒、デフォルト: ${DEFAULT_TIMEOUT}）`),
 });
 
+const NoteLoginStartSchema = z.object({
+  state_path: z.string().optional(),
+  force: z.boolean().optional(),
+});
+
+const NoteLoginFinishSchema = z.object({
+  state_path: z.string().optional(),
+  cancel: z.boolean().optional(),
+});
+
 // ツール定義
 const TOOLS: Tool[] = [
   {
@@ -3231,6 +3244,32 @@ const TOOLS: Tool[] = [
       required: ['message'],
     },
   },
+  {
+    name: 'note_login_start',
+    description:
+      'note.com へのログインを始めます。ブラウザの窓を開いてすぐ返るので、利用者がその窓でログインしてください。ログインが終わったら note_login_finish を呼びます（「ログインできた」と言われたら呼ぶ）。初回はブラウザ本体（約300MB）の取得から始まり数分かかります。ターミナルは不要です。すでにログイン済みならそのまま返します（入り直すときは force: true）。',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        state_path: { type: 'string', description: `認証状態の保存先（デフォルト: ${DEFAULT_STATE_PATH}）` },
+        force: { type: 'boolean', description: 'true なら、すでにログイン済みでも入り直す（別アカウントに切り替えるとき）' },
+      },
+      required: [],
+    },
+  },
+  {
+    name: 'note_login_finish',
+    description:
+      'note_login_start で開いた窓でログインが終わったかを確認し、済んでいれば認証情報を保存してブラウザを閉じます。まだなら「まだ」と返るので、少し置いてもう一度呼んでください。ブラウザ本体を取得している最中は、その進み具合を返します。cancel: true で中止してブラウザを閉じられます。',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        state_path: { type: 'string', description: `認証状態の保存先（デフォルト: ${DEFAULT_STATE_PATH}）` },
+        cancel: { type: 'boolean', description: 'true ならログインを中止してブラウザを閉じる' },
+      },
+      required: [],
+    },
+  },
 ];
 
 // ---------------------------------------------------------------------------
@@ -3550,6 +3589,464 @@ async function postToFacebook(params: {
     message,
     length,
     info: 'Facebook に投稿しました',
+  };
+}
+
+// ---------------------------------------------------------------------------
+// ログイン（2段構え）
+//
+// 以前は `npm run login`（scripts/login-note.js）だけだった。ブラウザを開いて
+// **ターミナルで Enter を押す**作りなので、ターミナルを持たない読者（Claude Desktop に
+// .mcpb を入れただけの人）には使えない。そこで MCP ツールとして作り直した。
+//
+// なぜ2段か: MCP のツール呼び出しには時間制限があり、人間がログインし終えるまで
+// 1回の呼び出しの中で待つと確実に落ちる。そこで
+//   note_login_start  … ブラウザを開いて**すぐ返す**
+//   note_login_finish … ログインできたかを cookie で見て、済んでいれば保存する
+// の2本に割り、AI 側に「できたら finish を呼ぶ／まだなら少し置いてもう一度」を
+// 促す文面を返り値に入れてある。
+//
+// Chromium は .mcpb に同梱しない（300MB 超あり、bundle が巨大になる）。
+// 入っていなければ start が裏で取得を始め、finish がその進み具合を報告する。
+// ---------------------------------------------------------------------------
+
+type LoginPhase = 'installing' | 'waiting';
+
+interface InstallState {
+  child: ChildProcess;
+  done: boolean;
+  ok: boolean;
+  tail: string[];
+  startedAt: number;
+  /** 最後に何か出力があった時刻。これが止まったら「進んでいない」と判断する。 */
+  lastProgressAt: number;
+  /** 見切って kill したときの理由。 */
+  stalledReason?: string;
+  /** 自前展開で救出できたときの記録。 */
+  rescue?: { ok: boolean; detail: string };
+}
+
+// 取得が止まったと見なすまでの無出力時間。
+// ⚠️ 2026-09-23 実測: この Mac では zip（136MB）を1分で落とし終えた後、展開に
+// 入らないまま無出力で止まる（11分待っても CPU 0%・展開先は空のまま）。
+// 2026-07-23 の導入時にも同じ症状が出ており、そのときは zip を手で展開して
+// 回避している。原因は未特定で、他の端末で起きるかも分かっていない。
+// 黙って永遠に待つのがいちばん悪いので、見切って理由を言う。
+const INSTALL_STALL_MS = parseInt(process.env.NOTE_POST_MCP_INSTALL_STALL_MS ?? '120000', 10);
+// 取得が 100% まで進んだ後は、健全なら展開は数秒で終わる（実測 0.5 秒）。
+// そこから先で黙ったら、もっと早く見切ってよい。
+const INSTALL_STALL_AFTER_DOWNLOAD_MS = parseInt(
+  process.env.NOTE_POST_MCP_INSTALL_STALL_AFTER_DOWNLOAD_MS ?? '30000',
+  10
+);
+
+interface LoginSession {
+  phase: LoginPhase;
+  statePath: string;
+  startedAt: number;
+  browser?: Browser;
+  context?: BrowserContext;
+  page?: Page;
+  install?: InstallState;
+}
+
+// 同時に1つだけ。ツール呼び出しをまたいでブラウザを生かしておくために
+// モジュールスコープに置く（MCP サーバーは常駐プロセスなので保持できる）。
+let loginSession: LoginSession | null = null;
+
+/** Chromium の実体がこの端末にあるか。 */
+function chromiumInstalled(): boolean {
+  try {
+    const p = chromium.executablePath();
+    return !!p && fs.existsSync(p);
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * 同梱の Playwright CLI の場所を突き止める。
+ *
+ * ⚠️ `require.resolve('playwright/cli.js')` は使えない（2026-09-23 実測）。
+ * playwright の package.json の `exports` が ./cli.js を公開していないので
+ * ERR_PACKAGE_PATH_NOT_EXPORTED で落ちる。パッケージの入口を解決してから
+ * そのディレクトリに cli.js を継ぎ足す。
+ */
+function resolvePlaywrightCli(): string {
+  const require_ = createRequire(import.meta.url);
+  for (const spec of ['playwright/package.json', 'playwright', 'playwright-core/package.json']) {
+    try {
+      const cli = path.join(path.dirname(require_.resolve(spec)), 'cli.js');
+      if (fs.existsSync(cli)) return cli;
+    } catch {
+      // 次の候補へ
+    }
+  }
+  throw new Error('Playwright の CLI が見つかりません（インストールが壊れている可能性があります）');
+}
+
+/** いま何秒黙ったら見切るか。ダウンロードが終わっていれば短くする。 */
+function stallWindowMs(inst: InstallState): number {
+  const downloaded = inst.tail.some((line) => line.includes('100%'));
+  return downloaded ? INSTALL_STALL_AFTER_DOWNLOAD_MS : INSTALL_STALL_MS;
+}
+
+/**
+ * Chromium が入るはずのディレクトリ（.../chromium-<rev>）。
+ * executablePath() は未インストールでも「入る予定の場所」を返すので、そこから辿る。
+ */
+function chromiumInstallDir(): string | null {
+  try {
+    const parts = chromium.executablePath().split(path.sep);
+    const i = parts.findIndex((p) => /^chromium-\d+$/.test(p));
+    return i < 0 ? null : parts.slice(0, i + 1).join(path.sep);
+  } catch {
+    return null;
+  }
+}
+
+/** Playwright が落とし終えた zip を探す（os.tmpdir() の playwright-download-* の中）。 */
+function findDownloadedChromiumZip(): string | null {
+  const tmp = os.tmpdir();
+  let best: { p: string; m: number } | null = null;
+  let dirs: string[] = [];
+  try {
+    dirs = fs.readdirSync(tmp);
+  } catch {
+    return null;
+  }
+  for (const d of dirs) {
+    if (!d.startsWith('playwright-download-')) continue;
+    let files: string[] = [];
+    try {
+      files = fs.readdirSync(path.join(tmp, d));
+    } catch {
+      continue;
+    }
+    for (const f of files) {
+      if (!f.endsWith('.zip') || !f.includes('chromium')) continue;
+      const full = path.join(tmp, d, f);
+      try {
+        const st = fs.statSync(full);
+        if (!best || st.mtimeMs > best.m) best = { p: full, m: st.mtimeMs };
+      } catch {
+        // 消えた・読めないものは飛ばす
+      }
+    }
+  }
+  return best?.p ?? null;
+}
+
+/**
+ * Playwright の展開が止まったときの逃げ道。落ちてきた zip を自分で展開する。
+ *
+ * ⚠️ なぜ要るか（2026-09-23 実測）: この Mac では zip の取得は 1 分で終わるのに、
+ * Playwright 自身の展開処理がそこから先へ進まない（無出力・CPU 0%・展開先は空のまま）。
+ * 同じ zip を `tar -xf` に渡すと **0.5 秒**で展開でき、出てきた Chromium は
+ * そのまま起動した。2026-07-23 の導入時も手で展開して回避している。
+ *
+ * tar を使うのは macOS と Windows 10 以降のどちらにも入っているため（unzip は
+ * Windows に無い）。zip の中の実行ビットもそのまま残る。
+ */
+function rescueChromiumFromZip(): { ok: boolean; detail: string } {
+  const zip = findDownloadedChromiumZip();
+  if (!zip) return { ok: false, detail: '落としかけの zip が見つかりませんでした' };
+  const target = chromiumInstallDir();
+  if (!target) return { ok: false, detail: '展開先が分かりませんでした' };
+  try {
+    fs.mkdirSync(target, { recursive: true });
+    execFileSync('tar', ['-xf', zip, '-C', target], { stdio: 'ignore', timeout: 300000 });
+  } catch (error) {
+    return { ok: false, detail: `展開に失敗しました: ${error instanceof Error ? error.message : String(error)}` };
+  }
+  if (!chromiumInstalled()) return { ok: false, detail: '展開はできましたが、ブラウザの実体が見つかりません' };
+  log('Chromium rescued by extracting the downloaded zip', { zip, target });
+  return { ok: true, detail: `自分で展開して用意しました（${path.basename(zip)}）` };
+}
+
+/** Playwright の CLI（同梱の node_modules 内）で Chromium を取りに行く。 */
+function startChromiumInstall(): InstallState {
+  const cli = resolvePlaywrightCli();
+  log('Chromium not found; starting download', { cli });
+  const child = spawn(process.execPath, [cli, 'install', 'chromium'], {
+    stdio: ['ignore', 'pipe', 'pipe'],
+  });
+  const state: InstallState = {
+    child,
+    done: false,
+    ok: false,
+    tail: [],
+    startedAt: Date.now(),
+    lastProgressAt: Date.now(),
+  };
+  const push = (buf: Buffer) => {
+    const text = buf.toString();
+    state.lastProgressAt = Date.now();
+    for (const line of text.split('\n')) {
+      const t = line.trim();
+      if (!t) continue;
+      state.tail.push(t);
+      if (state.tail.length > 12) state.tail.shift();
+    }
+  };
+  child.stdout?.on('data', push);
+  child.stderr?.on('data', push);
+  child.on('close', (code) => {
+    state.done = true;
+    state.ok = code === 0;
+    log('Chromium download finished', { code, seconds: ((Date.now() - state.startedAt) / 1000).toFixed(1) });
+  });
+  child.on('error', (err) => {
+    state.done = true;
+    state.ok = false;
+    state.tail.push(String(err));
+    log('Chromium download failed to start', err);
+  });
+  return state;
+}
+
+/**
+ * ログイン用のブラウザを開く。
+ *
+ * ⚠️ 他のツールは `--window-position=-2400,-2400` で画面外に逃がしているが、
+ * ここは**人間が操作する窓**なので必ず見える位置に出す。
+ */
+async function openLoginBrowser(statePath: string): Promise<void> {
+  const browser = await chromium.launch({
+    headless: false,
+    args: ['--lang=ja-JP', '--window-size=1280,900'],
+  });
+  // 既存の認証は読み込まない。読み込むとログイン済みの画面が出てしまい、
+  // 「別のアカウントで入り直したい」ときに手立てが無くなる。
+  const context = await browser.newContext({
+    locale: 'ja-JP',
+    viewport: { width: 1280, height: 860 },
+  });
+  const page = await context.newPage();
+  await page.goto('https://note.com/login', { waitUntil: 'domcontentloaded', timeout: 60000 });
+  loginSession = { phase: 'waiting', statePath, startedAt: Date.now(), browser, context, page };
+}
+
+/** 開いているログイン用ブラウザを閉じる（失敗しても無視する）。 */
+async function closeLoginBrowser(): Promise<void> {
+  const s = loginSession;
+  loginSession = null;
+  if (!s?.browser) return;
+  try {
+    await s.browser.close();
+  } catch {
+    // 利用者が先に窓を閉じていることがある。閉じられなくても実害は無い
+  }
+}
+
+/** 認証状態をファイルに書く。パーミッションは 600（Windows では設定しない）。 */
+function writeStateFile(statePath: string, state: unknown): void {
+  const dir = path.dirname(statePath);
+  if (dir && !fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
+  fs.writeFileSync(statePath, JSON.stringify(state, null, 2));
+  if (process.platform !== 'win32') {
+    fs.chmodSync(statePath, 0o600);
+  }
+}
+
+async function noteLoginStart(options: { statePath?: string; force?: boolean } = {}) {
+  const statePath = options.statePath ?? DEFAULT_STATE_PATH;
+  const force = options.force ?? false;
+
+  // すでに使える認証があるなら、黙って開き直さない
+  const existing = checkNoteLoginFile(statePath, (p) => fs.readFileSync(p, 'utf-8'), (p) => fs.existsSync(p));
+  if (existing.loggedIn && !force) {
+    return {
+      success: true,
+      already_logged_in: true,
+      state_path: statePath,
+      expires_at: existing.expiresAt,
+      info: 'すでにログイン済みです。入り直したいときは force: true を付けてもう一度呼んでください',
+    };
+  }
+
+  // すでに窓が開いているなら二重に開かない
+  if (loginSession?.phase === 'waiting') {
+    return {
+      success: true,
+      status: 'waiting_for_login',
+      state_path: loginSession.statePath,
+      info: 'ログイン用のブラウザはもう開いています。そちらで note にログインしてください',
+      next: 'ログインが終わったら「ログインできた」と伝えてください（note_login_finish を呼びます）',
+    };
+  }
+
+  // Chromium が無ければ先に取りに行く（数分かかる）
+  if (!chromiumInstalled()) {
+    if (loginSession?.phase !== 'installing') {
+      loginSession = {
+        phase: 'installing',
+        statePath,
+        startedAt: Date.now(),
+        install: startChromiumInstall(),
+      };
+    }
+    return {
+      success: true,
+      status: 'installing_browser',
+      state_path: statePath,
+      info: '初回だけ、note を操作するためのブラウザ（約300MB）を取りに行きます。数分かかります',
+      next: '1分ほど置いてから「準備できた?」と聞いてください（note_login_finish で進み具合を見ます）',
+    };
+  }
+
+  await openLoginBrowser(statePath);
+  return {
+    success: true,
+    status: 'waiting_for_login',
+    state_path: statePath,
+    info: 'ブラウザの窓を開きました。表示された note のログイン画面で、いつもの方法でログインしてください',
+    next: 'ログインが終わったら「ログインできた」と伝えてください（note_login_finish を呼びます）',
+  };
+}
+
+async function noteLoginFinish(options: { statePath?: string; cancel?: boolean } = {}) {
+  const statePath = options.statePath ?? loginSession?.statePath ?? DEFAULT_STATE_PATH;
+
+  if (options.cancel) {
+    await closeLoginBrowser();
+    return { success: true, status: 'cancelled', info: 'ログインを中止し、ブラウザを閉じました' };
+  }
+
+  // 取得中なら進み具合を返す
+  if (loginSession?.phase === 'installing' && loginSession.install) {
+    const inst = loginSession.install;
+    const seconds = Math.round((Date.now() - inst.startedAt) / 1000);
+
+    // 進んでいないなら見切る（黙って待ち続けない）
+    const window = stallWindowMs(inst);
+    if (!inst.done && Date.now() - inst.lastProgressAt > window) {
+      inst.stalledReason = `${Math.round(window / 1000)}秒のあいだ進みませんでした`;
+      inst.done = true;
+      try {
+        inst.child.kill();
+      } catch {
+        // すでに終わっていることがある
+      }
+      log('Chromium download stalled; killed', { seconds, tail: inst.tail.slice(-4) });
+      // 止まるのはたいてい展開のところで、zip 自体は落ちきっている。自分で展開してみる
+      inst.rescue = rescueChromiumFromZip();
+      inst.ok = inst.rescue.ok;
+    }
+
+    if (!inst.done) {
+      return {
+        success: true,
+        status: 'installing_browser',
+        elapsed_seconds: seconds,
+        progress: inst.tail.slice(-3),
+        info: 'ブラウザをまだ取りに行っています',
+        next: 'もう1分ほど置いてから、また「準備できた?」と聞いてください',
+      };
+    }
+    if (!inst.ok || !chromiumInstalled()) {
+      loginSession = null;
+      return {
+        success: false,
+        status: inst.stalledReason ? 'install_stalled' : 'install_failed',
+        elapsed_seconds: seconds,
+        detail: inst.tail.slice(-6),
+        rescue: inst.rescue?.detail,
+        error: inst.stalledReason
+          ? `ブラウザの取得が途中で止まり、自分で展開する方法も駄目でした（${inst.stalledReason}／${inst.rescue?.detail ?? '-'}）。もう一度ログインを始めるとやり直せます`
+          : 'ブラウザの取得に失敗しました。ネットワークにつながっているか確認して、もう一度ログインを始めてください',
+      };
+    }
+    await openLoginBrowser(statePath);
+    return {
+      success: true,
+      status: 'waiting_for_login',
+      install_seconds: seconds,
+      ...(inst.rescue?.ok ? { install_note: inst.rescue.detail } : {}),
+      state_path: statePath,
+      info: 'ブラウザの用意ができたので、note のログイン画面を開きました。ログインしてください',
+      next: 'ログインが終わったら「ログインできた」と伝えてください',
+    };
+  }
+
+  // 窓が開いていない場合。すでに保存済みならそれを答える
+  if (!loginSession?.context) {
+    const existing = checkNoteLoginFile(statePath, (p) => fs.readFileSync(p, 'utf-8'), (p) => fs.existsSync(p));
+    if (existing.loggedIn) {
+      return {
+        success: true,
+        status: 'already_saved',
+        state_path: statePath,
+        expires_at: existing.expiresAt,
+        info: 'すでにログイン済みの状態が保存されています',
+      };
+    }
+    return {
+      success: false,
+      status: 'not_started',
+      error: 'ログイン用のブラウザが開いていません。先に「noteにログインして」と伝えてください（note_login_start）',
+      detail: existing.reason,
+    };
+  }
+
+  // 窓が開いている。cookie を見て、済んでいれば保存する
+  let state: unknown;
+  try {
+    state = await loginSession.context.storageState();
+  } catch (error) {
+    await closeLoginBrowser();
+    return {
+      success: false,
+      status: 'browser_closed',
+      error: 'ログイン用のブラウザが閉じられていました。もう一度「noteにログインして」と伝えてください',
+      detail: error instanceof Error ? error.message : String(error),
+    };
+  }
+
+  const check = checkNoteLogin(state as any);
+  if (!check.loggedIn) {
+    return {
+      success: true,
+      status: 'waiting_for_login',
+      logged_in: false,
+      reason: check.reason,
+      waited_seconds: Math.round((Date.now() - loginSession.startedAt) / 1000),
+      next: 'ブラウザでのログインがまだ終わっていないようです。終わってから、もう一度「ログインできた」と伝えてください',
+    };
+  }
+
+  // ⚠️ ここが本当の判定。cookie の有無だけでは足りない（2026-09-23 実測: note は
+  // ログイン前の訪問者にも note_gql_auth_token を置くので、まっさらなブラウザでも
+  // cookie は揃って見える）。note 自身に聞いて名前が返って初めてログイン成立。
+  let urlname: string | null = null;
+  try {
+    urlname = await fetchUrlname(loginSession.page);
+  } catch (error) {
+    log('Login verification call failed', error);
+  }
+  if (!urlname) {
+    return {
+      success: true,
+      status: 'waiting_for_login',
+      logged_in: false,
+      reason: 'note がまだ自分のアカウントを返しません（ログインが終わっていないようです）',
+      waited_seconds: Math.round((Date.now() - loginSession.startedAt) / 1000),
+      next: 'ログイン後のホーム画面が出るまで待ってから、もう一度「ログインできた」と伝えてください',
+    };
+  }
+
+  writeStateFile(statePath, state);
+  await closeLoginBrowser();
+  log('Login state saved', { statePath, urlname, expiresAt: check.expiresAt });
+  return {
+    success: true,
+    status: 'saved',
+    logged_in: true,
+    account: urlname,
+    state_path: statePath,
+    cookie_expires_at: check.expiresAt,
+    info: `${urlname} としてログインできました。認証情報を保存し、ブラウザを閉じました`,
+    next: 'これで記事の下書き作成や公開ができます。しばらく経つと切れるので、そのときはまた「noteにログインして」と伝えてください',
   };
 }
 
@@ -3897,6 +4394,18 @@ async function handleToolCall(name: string, args: unknown): Promise<any> {
       return {
         content: [{ type: 'text', text: JSON.stringify(result, null, 2) }],
       };
+    }
+
+    if (name === 'note_login_start') {
+      const params = NoteLoginStartSchema.parse(args);
+      const result = await noteLoginStart({ statePath: params.state_path, force: params.force });
+      return { content: [{ type: 'text', text: JSON.stringify(result, null, 2) }] };
+    }
+
+    if (name === 'note_login_finish') {
+      const params = NoteLoginFinishSchema.parse(args);
+      const result = await noteLoginFinish({ statePath: params.state_path, cancel: params.cancel });
+      return { content: [{ type: 'text', text: JSON.stringify(result, null, 2) }] };
     }
 
     throw new Error(`Unknown tool: ${name}`);

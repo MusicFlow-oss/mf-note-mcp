@@ -1,0 +1,56 @@
+{
+  "manifest_version": "0.2",
+  "name": "mf-note-mcp",
+  "display_name": "note 投稿ツール（MusicFlow）",
+  "version": "1.0.16",
+  "description": "note.com の下書き作成・公開・マガジン管理を AI にまかせるためのツールです。ターミナルは要りません。",
+  "long_description": "手元の Markdown から note.com の下書きを作り、アイキャッチを付け、タグを付けて公開し、マガジンに入れるところまでを AI から操作できるようにします。\n\n最初に「noteにログインして」と伝えると、ブラウザの窓が開きます。いつもの方法で note にログインすると、その状態だけがこの端末に保存されます。パスワードは保存しません。\n\n初回はブラウザ本体（約300MB）の取得に数分かかります。記事を操作している間は、見える窓が自動で動きます。触らずに終わるまで待ってください。",
+  "author": {
+    "name": "MusicFlow",
+    "email": "haru@musicflow.tokyo",
+    "url": "https://note.com/musicflow"
+  },
+  "homepage": "https://github.com/MusicFlow-oss/mf-note-mcp",
+  "documentation": "https://github.com/MusicFlow-oss/mf-note-mcp#readme",
+  "support": "https://github.com/MusicFlow-oss/mf-note-mcp/issues",
+  "icon": "icon.png",
+  "license": "MIT",
+  "keywords": ["note", "blog", "publishing", "markdown", "automation"],
+  "server": {
+    "type": "node",
+    "entry_point": "build/index.js",
+    "mcp_config": {
+      "command": "node",
+      "args": ["${__dirname}/build/index.js"],
+      "env": {}
+    }
+  },
+  "tools": [
+    { "name": "note_login_start", "description": "note へのログインを始める（ブラウザの窓が開きます）" },
+    { "name": "note_login_finish", "description": "ログインできたかを確かめて保存する" },
+    { "name": "save_draft", "description": "Markdown から下書きを作る（アイキャッチも付けられます）" },
+    { "name": "update_draft", "description": "既存の記事を書き直す" },
+    { "name": "publish_draft", "description": "下書きを公開する（タグ・価格はここで付けます）" },
+    { "name": "publish_note", "description": "Markdown からそのまま公開する" },
+    { "name": "list_notes", "description": "自分の記事一覧を見る" },
+    { "name": "update_tags", "description": "公開済み記事のタグを直す" },
+    { "name": "update_price", "description": "有料記事の値段を変える" },
+    { "name": "delete_note", "description": "記事を削除する" },
+    { "name": "list_magazines", "description": "マガジン一覧を見る" },
+    { "name": "create_magazine", "description": "マガジンを作る" },
+    { "name": "update_magazine", "description": "マガジンの名前・説明・カバー画像を変える" },
+    { "name": "delete_magazine", "description": "マガジンを消す" },
+    { "name": "add_to_magazine", "description": "公開済み記事をマガジンに入れる" },
+    { "name": "remove_from_magazine", "description": "マガジンから記事を外す" },
+    { "name": "post_to_x", "description": "X に投稿する（別途 鍵の登録が要ります）" },
+    { "name": "post_to_facebook", "description": "Facebook Page に投稿する（別途 鍵の登録が要ります）" },
+    { "name": "server_info", "description": "いま動いているこのツールの版を返す" }
+  ],
+  "compatibility": {
+    "claude_desktop": ">=0.10.0",
+    "platforms": ["darwin", "win32"],
+    "runtimes": {
+      "node": ">=18.0.0"
+    }
+  }
+}

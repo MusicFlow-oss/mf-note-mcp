@@ -1,69 +1,54 @@
 #!/usr/bin/env node
 
+// ターミナルから使うログイン（MCP ツール note_login_start / note_login_finish と同じ判定）。
+//
+// ⚠️ ログイン済みかの判定は build/login.js の checkNoteLogin ただ1つに寄せてある。
+// ここに同じ判定を書き写さないこと（二重実装になり、片方だけ直す事故が起きる）。
+// そのため実行前に `npm run build` が要る。
+//
+// 以前は「ログインが終わったらターミナルで Enter」だったが、cookie を見て自動で
+// 気づくようにした。Enter を押せない環境（Claude Desktop の利用者）と同じ経路を、
+// ターミナル側でも使うため。
+
 import { chromium } from 'playwright';
 import fs from 'fs';
 import path from 'path';
-import readline from 'readline';
+import { checkNoteLogin } from '../build/login.js';
 
-// デフォルトの保存先
 const DEFAULT_STATE_PATH = path.join(process.env.HOME || process.env.USERPROFILE, '.note-state.json');
+const POLL_INTERVAL_MS = 2000;
+const TIMEOUT_MS = 10 * 60 * 1000;
 
-/**
- * note.com にログインして認証状態を保存するスクリプト
- */
 async function loginToNote() {
-  // サーバー本体（src/index.ts）と同じ環境変数を見る。旧名 NOTE_STATE_PATH も後方互換で受ける
   const statePath =
     process.env.NOTE_POST_MCP_STATE_PATH || process.env.NOTE_STATE_PATH || DEFAULT_STATE_PATH;
-  
+
   console.log('='.repeat(60));
-  console.log('note.com ログインスクリプト');
+  console.log('note.com ログイン');
   console.log('='.repeat(60));
   console.log();
   console.log(`認証状態の保存先: ${statePath}`);
   console.log();
 
-  // 既存のファイルがある場合は確認
   if (fs.existsSync(statePath)) {
-    console.log('⚠️  既存の認証ファイルが見つかりました。');
-    console.log('新しい認証情報で上書きしますか？ (y/N): ');
-    
-    const rl = readline.createInterface({
-      input: process.stdin,
-      output: process.stdout
-    });
-
-    const answer = await new Promise((resolve) => {
-      rl.question('', (ans) => {
-        rl.close();
-        resolve(ans);
-      });
-    });
-
-    if (answer.toLowerCase() !== 'y' && answer.toLowerCase() !== 'yes') {
-      console.log('キャンセルしました。');
-      process.exit(0);
-    }
+    console.log('⚠️  既存の認証ファイルは、ログインが終わった時点で上書きします。');
+    console.log();
   }
 
-  console.log();
   console.log('ブラウザを起動します...');
-  
+
   const browser = await chromium.launch({
     headless: false,
-    args: ['--lang=ja-JP']
+    args: ['--lang=ja-JP'],
   });
 
   try {
     const context = await browser.newContext({
       locale: 'ja-JP',
-      viewport: { width: 1280, height: 720 }
+      viewport: { width: 1280, height: 720 },
     });
-    
-    const page = await context.newPage();
 
-    console.log();
-    console.log('note.com のログインページを開きます...');
+    const page = await context.newPage();
     await page.goto('https://note.com/login', { waitUntil: 'domcontentloaded' });
 
     console.log();
@@ -71,45 +56,45 @@ async function loginToNote() {
     console.log('📝 ブラウザでログインしてください');
     console.log('━'.repeat(60));
     console.log();
-    console.log('1. メールアドレス/パスワードまたは外部サービスでログイン');
-    console.log('2. ログイン完了後、ホーム画面が表示されることを確認');
-    console.log('3. このターミナルに戻って Enter キーを押してください');
+    console.log('ログインが終わると自動で気づいて保存します（Enter は不要）。');
+    console.log('中止するときは Ctrl+C。');
     console.log();
 
-    // ユーザーがログインするまで待機
-    const rl = readline.createInterface({
-      input: process.stdin,
-      output: process.stdout
-    });
+    const startedAt = Date.now();
+    let saved = false;
 
-    await new Promise((resolve) => {
-      rl.question('Enter キーを押してください...', () => {
-        rl.close();
-        resolve();
-      });
-    });
+    while (Date.now() - startedAt < TIMEOUT_MS) {
+      let state;
+      try {
+        state = await context.storageState();
+      } catch (error) {
+        console.error('ブラウザが閉じられました。中止します。');
+        process.exit(1);
+      }
 
-    console.log();
-    console.log('認証状態を保存しています...');
+      const check = checkNoteLogin(state);
+      if (check.loggedIn) {
+        const dir = path.dirname(statePath);
+        if (dir && !fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
+        fs.writeFileSync(statePath, JSON.stringify(state, null, 2));
+        if (process.platform !== 'win32') fs.chmodSync(statePath, 0o600);
+        saved = true;
+        console.log();
+        console.log('✅ 認証状態を保存しました！');
+        console.log(`保存先: ${statePath}`);
+        if (check.expiresAt) console.log(`有効期限: ${check.expiresAt}`);
+        break;
+      }
 
-    // ディレクトリが存在しない場合は作成
-    const dir = path.dirname(statePath);
-    if (!fs.existsSync(dir)) {
-      fs.mkdirSync(dir, { recursive: true });
+      await new Promise((r) => setTimeout(r, POLL_INTERVAL_MS));
     }
 
-    // 認証状態を保存
-    await context.storageState({ path: statePath });
-
-    // パーミッションを制限（セキュリティのため）
-    if (process.platform !== 'win32') {
-      fs.chmodSync(statePath, 0o600);
+    if (!saved) {
+      console.error();
+      console.error('❌ 時間内にログインが確認できませんでした。やり直してください。');
+      process.exit(1);
     }
 
-    console.log();
-    console.log('✅ 認証状態を保存しました！');
-    console.log();
-    console.log(`保存先: ${statePath}`);
     console.log();
     console.log('━'.repeat(60));
     console.log('次のステップ:');
@@ -120,7 +105,6 @@ async function loginToNote() {
     console.log();
     console.log('詳細は README.md の "Register with a client" を参照してください。');
     console.log();
-
   } catch (error) {
     console.error();
     console.error('❌ エラーが発生しました:', error.message);
@@ -131,9 +115,7 @@ async function loginToNote() {
   }
 }
 
-// スクリプト実行
 loginToNote().catch((error) => {
   console.error('Fatal error:', error);
   process.exit(1);
 });
-

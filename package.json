@@ -17,7 +17,8 @@
     "dev": "tsc --watch",
     "test": "npm run build && node --test test/*.test.mjs",
     "login": "node scripts/login-note.js",
-    "install-browser": "npx playwright install chromium"
+    "install-browser": "npx playwright install chromium",
+    "pack": "node scripts/pack-mcpb.js"
   },
   "keywords": [
     "mcp",
